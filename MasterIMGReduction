@@ -1,0 +1,225 @@
+############################################################################################################################################################################################
+#                                                                                                                                                                                          #
+#   The Purpose of this program is to essentially do a modernized version of IRAF image reduction. This program calls files from specified folders and is able to separate the files based #
+#   off the filter of the detector, which is available to be inspected via the header option in DS9. After it does this it trims the overscan for each image and adds it to a list by a    #
+#   process of 'for' loops. After this task the program will use specific objects from ccdproc to remove extreme pixel values caused by cosmic rays hitting the ccd detector. Once this    #
+#   process is complete I have the function create master images and assign them to be ccd object types with the same size such that the image arithmetic is able to be completed. After   #
+#   these series of processes are carried out for the biases, darks, and flats, I am able to do the image combinations/reductions. A handy feature of my code is that if I wish to add more#
+#   source, bias, dark, or flat images I can simply add them to the folder of which the others are assigned and run the code again. It will add the new images and resume stacking as      #
+#   intended.                                                                                                                                                                              #
+#                                                                                                                                                                                          #
+############################################################################################################################################################################################
+
+
+# import the necessary libraries
+
+from pathlib import Path
+from astropy.nddata import CCDData
+from ccdproc import ImageFileCollection
+from convenience_functions import show_image
+import ccdproc as ccdp
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from astropy.io import fits
+%matplotlib inline
+from os import listdir, walk
+import time
+import os
+import astropy as ap
+import scipy as sp
+from astropy import units as u
+
+#____________________________________________________________________________________________________________________________________________________________________________________________#
+
+
+# Begin with compiling a list of the source images that separates them based off of the filter of the detector
+
+sourcepath = Path('fits/1237666214607323491') # Create a simple 'path' variable
+raw_sourceimgs = ccdp.ImageFileCollection(sourcepath) # Load list of fits files as a collection for convenience
+raw_sourceimgs.summary['file', 'detector', 'exptime', 'biassec']
+
+# Here I will create a function that utilizes the list here and is able to discern the filters of the detector. This function takes each image based on the filter and trims the overscan.
+# After trimming the overscan it removes the cosmic rays using sigma clipping and a ccdproc function called lacosmic. I'll explain the process of sigma clipping and lacosmic in the
+# function when they are used.
+
+def Source(raw_sourceimgs, dichroic, angle):
+    sourceList = raw_sourceimgs.files_filtered(include_path=True, detector= dichroic)
+    ccdSource = []
+    for img in sourceList:
+        fitsfile = fits.open(img)
+        ccd = CCDData(fitsfile[0].data, unit="adu")
+        ccdSource.append(ccd)
+        fitsfile.close()
+
+    # Now I create a 'for' loop that trimms the overscan and resizes the image, and I utilize this same process for the biases, darks, and flats. After each 
+    # iteration the next image will be trimmed, resized, then added to a list called trimmedSource. This process is used for the biases, darks, and flats. 
+    # Those lists will be named 'trimmedBias', 'trimmedDark', and 'trimmedFlat' respectively.
+
+    trimmedSource = []
+    for image in ccdSource:
+        source_overscan_sub = ccdp.subtract_overscan(image, fits_section="[2051:2096, :]", median=True)
+        trimmed_source = ccdp.trim_image(source_overscan_sub, fits_section="[:2050, 460:820]")
+        trimmedSource.append(trimmed_source)
+
+    # I now utilize object of ccdproc that allow me to remove the hard-to-get overexposed pixels i.e. the cosmic rays. the function utilizes a widely recognized
+    # method called 'sigma clipping' where extreme pixel values are removed. LACosmic acts as a 'clean-up' for pixels that the sigma clipping failed
+    # to address. I utilize this same method for the biases, darks, and flats. After this I rotate the entire image to align the spectrum such that it is 
+    # parallel to the x-axis. 
+
+    Combiner = ccdp.Combiner(trimmedSource)                     ## cccdproc has a class/object called Combiner. Created a class for all the trimmed reds
+    Combiner.sigma_clipping(5, 5, func=np.ma.median)            ## sigma_clipping is a method of the combiner class
+    CombinedSource = Combiner.average_combine()
+    CombinedSource_fixed = ccdp.cosmicray_lacosmic(CombinedSource, sigclip = 1, niter = 50)
+    MasterSource = sp.ndimage.interpolation.rotate(CombinedSource_fixed, angle = angle)
+    MasterSource_ccd = CCDData(MasterSource, unit="adu")         # the appearance of these lines throughout ensure that all of the images are CCDData types and allows for 
+                                                                 # arithmetic of subtracting the biases, then darks, then dividing out the flats. THE IMAGES MUST BE OF THE 
+                                                                 # EXACT SAME SIZE IN ORDER FOR THE MATH TO WORK!!!
+            
+    return MasterSource_ccd
+
+MasterSourceR_ccd = Source(raw_sourceimgs, "red", -0.7)
+MasterSourceB_ccd = Source(raw_sourceimgs, "blue", -0.7)
+
+#____________________________________________________________________________________________________________________________________________________________________________________________#
+
+
+# This next process is an effort to create a master bias image that will be used for the arithmetic later. Making two master biases was requiired according to the detector filter,
+# and each process has a discernable nomenclature to delineate this.
+
+# Here I compile a list of the bias images that separates them based off of the filter of the detector
+
+biaspath = Path('fits/Biases_UT191231') # Create a simple 'path' variable
+raw_biasimgs = ccdp.ImageFileCollection(biaspath) # Load list of fits files as a collection for convenience
+raw_biasimgs.summary['file', 'detector', 'exptime', 'biassec']
+
+def Bias(raw_biasimgs, dichroic, angle):
+
+    biasList = raw_biasimgs.files_filtered(include_path=True, detector= dichroic)
+    ccdBiases = []
+    for img in biasList:
+        fitsfile = fits.open(img)
+        ccd = CCDData(fitsfile[0].data, unit="adu")
+        ccdBiases.append(ccd)
+        fitsfile.close()
+
+    trimmedBiases = []
+    for image in ccdBiases:
+        bias_overscan_sub = ccdp.subtract_overscan(image, fits_section="[2051:2096, :]", median=True)
+        trimmed_bias = ccdp.trim_image(bias_overscan_sub, fits_section="[:2050, 460:820]")
+        trimmedBiases.append(trimmed_bias)
+
+
+    Combiner = ccdp.Combiner(trimmedBiases)
+    Combiner.sigma_clipping(5, 5)
+    CombinedBiases = Combiner.average_combine()
+    CombinedBiases_fixed = ccdp.cosmicray_lacosmic(CombinedBiases, sigclip = 1, niter = 50)
+    MasterBias = sp.ndimage.interpolation.rotate(CombinedBiases_fixed, angle = angle)
+    MasterBias_ccd = CCDData(MasterBias, unit="adu")
+    
+    return MasterBias_ccd
+
+MasterBiasR_ccd = Bias(raw_biasimgs, "red", -0.7)
+MasterBiasB_ccd = Bias(raw_biasimgs, "blue", -0.7)
+
+#____________________________________________________________________________________________________________________________________________________________________________________________#
+
+
+# This next process is an effort to create a master dark image that will be used for the arithmetic later.
+
+# Here I compile a list of the dark images that separates them based off of the filter of the detector
+
+darkpath = Path('fits/Darks_UT191231') # Create a simple 'path' variable
+raw_darkimgs = ccdp.ImageFileCollection(darkpath) # Load list of fits files as a collection for convenience
+raw_darkimgs.summary['file', 'detector', 'exptime', 'biassec']
+
+def Dark(raw_darkimgs, dichroic, angle):
+
+    darkList = raw_darkimgs.files_filtered(include_path=True, detector= dichroic)
+    ccdDarks = []
+    for img in darkList:
+        fitsfile = fits.open(img)
+        ccd = CCDData(fitsfile[0].data, unit="adu")
+        ccdDarks.append(ccd)
+        fitsfile.close()
+
+    trimmedDarks = []
+    for image in ccdDarks:
+        dark_overscan_sub = ccdp.subtract_overscan(image, fits_section="[2051:2096, :]", median=True)
+        trimmed_dark = ccdp.trim_image(dark_overscan_sub, fits_section="[:2050, 460:820]")
+        trimmedDarks.append(trimmed_dark)
+
+    Combiner = ccdp.Combiner(trimmedDarks)
+    Combiner.sigma_clipping(5, 5)
+    CombinedDarks = Combiner.average_combine()
+    CombinedDarks_fixed = ccdp.cosmicray_lacosmic(CombinedDarks, sigclip = 1, niter = 50)
+    MasterDark = sp.ndimage.interpolation.rotate(CombinedDarks_fixed, angle = angle)
+    MasterDark_ccd = CCDData(MasterDark, unit="adu")
+
+    return MasterDark_ccd
+
+MasterDarkR_ccd = Dark(raw_darkimgs, "red", -0.7)
+MasterDarkB_ccd = Dark(raw_darkimgs, "blue", -0.7)
+
+#____________________________________________________________________________________________________________________________________________________________________________________________#
+
+
+# This next process is an effort to create a master flat image that will be used for the arithmetic later. Making two master flats was requiired according to the detector filter,
+# and each process has a discernable nomenclature to delineate this.
+
+# # Here I compile a list of the dark images that separates them based off of the filter of the detector
+
+flatpath = Path('fits/Flats_UT191231') # Create a simple 'path' variable
+raw_flatimgs = ccdp.ImageFileCollection(flatpath) # Load list of fits files as a collection for convenience
+raw_flatimgs.summary['file', 'detector', 'exptime', 'biassec']
+
+def Flat(raw_flatimgs, dichroic, angle):
+
+    flatList = raw_flatimgs.files_filtered(include_path=True, detector= dichroic)
+    ccdFlats = []
+    for img in flatList:
+        fitsfile = fits.open(img)
+        ccd = CCDData(fitsfile[0].data, unit="adu")
+        ccdFlats.append(ccd)
+        fitsfile.close()
+
+    trimmedFlats = []
+    for image in ccdFlats:
+        flat_overscan_sub = ccdp.subtract_overscan(image, fits_section="[2051:2096, :]", median=True)
+        trimmed_flat = ccdp.trim_image(flat_overscan_sub, fits_section="[:2050, 460:820]")
+        trimmedFlats.append(trimmed_flat)
+
+    Combiner = ccdp.Combiner(trimmedFlats)
+    Combiner.sigma_clipping(5, 5)
+    CombinedFlats = Combiner.average_combine()
+    CombinedFlats_fixed = ccdp.cosmicray_lacosmic(CombinedFlats, sigclip = 1, niter = 50)
+    MasterFlat = sp.ndimage.interpolation.rotate(CombinedFlats_fixed, angle = angle)
+    MasterFlat_ccd = CCDData(MasterFlat, unit="adu")
+    
+    return MasterFlat_ccd
+
+MasterFlatR_ccd = Flat(raw_flatimgs, "red", -0.7)
+MasterFlatB_ccd = Flat(raw_flatimgs, "blue", -0.7)
+
+#____________________________________________________________________________________________________________________________________________________________________________________________#
+
+
+# This small section is the image arithmetic that allows me to subtract the master biases from the master sources to create a new image. That new image 
+# will then have the master darks subtracted from it to create a new image again. That next new image will have the flats be divided from it, forming a new 
+# master source image that has eliminated all of the noise and extreme pixel values.
+
+bias_subtractedR = ccdp.subtract_bias(MasterSourceR_ccd, MasterBiasR_ccd)
+bias_subtractedB = ccdp.subtract_bias(MasterSourceB_ccd, MasterBiasB_ccd)
+show_image(bias_subtractedR, figsize=(20,16), log=False, show_colorbar=False)
+
+dark_subtractedR = ccdp.subtract_dark(bias_subtractedR, MasterDarkR_ccd, dark_exposure = 60 * u.s, data_exposure = 600 * u.s)
+dark_subtractedB = ccdp.subtract_dark(bias_subtractedB, MasterDarkB_ccd, dark_exposure = 60 * u.s, data_exposure = 600 * u.s)
+show_image(dark_subtractedR, figsize=(20,16), log=False, show_colorbar=False)
+
+flat_correctedR = ccdp.flat_correct(dark_subtractedR, MasterFlatR_ccd)
+flat_correctedB = ccdp.flat_correct(dark_subtractedB, MasterFlatB_ccd)
+show_image(flat_correctedR, figsize=(20,16), log=False, show_colorbar=False)
+# show_image(flat_correctedB, figsize=(20,16), log=False, show_colorbar=False)
+
+# flat_correctedR.write("fits/All_Masters/MasterR_1237666214607323491_2.fits")
+# flat_correctedB.write("fits/All_Masters/MasterB_1237666214607323491_2.fits")
